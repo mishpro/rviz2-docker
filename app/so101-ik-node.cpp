@@ -86,7 +86,7 @@ public:
         declare_parameter("collision_d_min", 0.005);
         declare_parameter("collision_margin", 0.010);
         declare_parameter("weight_pos", 1.0);
-        declare_parameter("weight_orient", 0.1);
+        declare_parameter("weight_orient", 1.0);
 
         // Рабочая область: r_max через FK в нескольких позах
         computeWorkspaceRadius();
