@@ -21,6 +21,21 @@
 
 enum class IKStatus { Converged, Approximate, Projected, Failed };
 
+// Axis-angle logarithm of rotation matrix (Rodrigues inverse).
+// R near I → uses skew-symmetric part; else returns θ·axis with θ = acos((tr(R)-1)/2).
+Eigen::Vector3d log3_rotation(const Eigen::Matrix3d& R) {
+    double cos_theta = std::max(-1.0, std::min(1.0, (R.trace() - 1.0) * 0.5));
+    double theta = std::acos(cos_theta);
+    Eigen::Vector3d skew;
+    skew << R(2,1) - R(1,2),
+            R(0,2) - R(2,0),
+            R(1,0) - R(0,1);
+    if (theta < 1e-6) {
+        return 0.5 * skew;
+    }
+    return (theta / (2.0 * std::sin(theta))) * skew;
+}
+
 class SO101IKNode : public rclcpp::Node {
 public:
     SO101IKNode(const std::string &urdf_path)
@@ -70,6 +85,8 @@ public:
         declare_parameter("weight_collision", 0.5);
         declare_parameter("collision_d_min", 0.005);
         declare_parameter("collision_margin", 0.010);
+        declare_parameter("weight_pos", 1.0);
+        declare_parameter("weight_orient", 0.1);
 
         // Рабочая область: r_max через FK в нескольких позах
         computeWorkspaceRadius();
@@ -80,7 +97,8 @@ public:
                 get_parameter("init_target_x").as_double(),
                 get_parameter("init_target_y").as_double(),
                 get_parameter("init_target_z").as_double());
-            q_current_ = solveIK(init_target, q_current_, /*track_status=*/nullptr);
+            q_current_ = solveIK(init_target, Eigen::Matrix3d::Identity(),
+                                  q_current_, /*track_status=*/nullptr);
             q_target_ = q_current_;
             q_start_interp_ = q_current_;
         }
@@ -93,7 +111,7 @@ public:
             "/collision_marker", 10);
 
         // Subscriber
-        target_sub_ = create_subscription<geometry_msgs::msg::PointStamped>(
+        target_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
             "/target_pose", 10,
             std::bind(&SO101IKNode::targetCallback, this, std::placeholders::_1));
 
@@ -111,27 +129,34 @@ public:
     }
 
 private:
-    void targetCallback(const geometry_msgs::msg::PointStamped::SharedPtr msg) {
-        Eigen::Vector3d target(msg->point.x, msg->point.y, msg->point.z);
-        RCLCPP_INFO(get_logger(), "New target: [%.3f, %.3f, %.3f]",
-                    target.x(), target.y(), target.z());
+    void targetCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg) {
+        Eigen::Vector3d target(msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
+        Eigen::Quaterniond q_msg(msg->pose.orientation.w, msg->pose.orientation.x,
+                                  msg->pose.orientation.y, msg->pose.orientation.z);
+        if (q_msg.norm() < 1e-6) q_msg = Eigen::Quaterniond::Identity();
+        Eigen::Matrix3d target_rot = q_msg.normalized().toRotationMatrix();
+        RCLCPP_INFO(get_logger(), "New target: pos=[%.3f, %.3f, %.3f], orient=[%.3f, %.3f, %.3f, %.3f]",
+                    target.x(), target.y(), target.z(),
+                    q_msg.x(), q_msg.y(), q_msg.z(), q_msg.w());
 
-        // Проекция на рабочую область
+        // Проекция на рабочую область (только позиция)
         IKStatus status = IKStatus::Converged;
         target = projectToWorkspace(target, status);
 
         // Решаем IK от текущей позы
-        Eigen::VectorXd q = solveIK(target, q_current_, &status);
+        Eigen::VectorXd q = solveIK(target, target_rot, q_current_, &status);
 
         pinocchio::forwardKinematics(model_, data_, q);
         pinocchio::updateFramePlacement(model_, data_, ee_id_);
         Eigen::Vector3d ee_pos = data_.oMf[ee_id_].translation();
+        Eigen::Matrix3d ee_rot = data_.oMf[ee_id_].rotation();
         const char* st = (status == IKStatus::Converged)   ? "converged"
                        : (status == IKStatus::Approximate) ? "approximate"
                        : (status == IKStatus::Projected)   ? "projected" : "failed";
-        RCLCPP_INFO(get_logger(), "IK %s, final EE=[%.3f, %.3f, %.3f] err=%.4f",
-                    st, ee_pos.x(), ee_pos.y(), ee_pos.z(),
-                    (target - ee_pos).norm());
+        Eigen::Vector3d pos_err = target - ee_pos;
+        Eigen::Vector3d rot_err = log3_rotation(target_rot * ee_rot.transpose());
+        RCLCPP_INFO(get_logger(), "IK %s, final EE pos err=%.4f rot err=%.4f (rad)",
+                    st, pos_err.norm(), rot_err.norm());
 
         q_target_ = q;
         interp_step_ = 0;
@@ -140,7 +165,7 @@ private:
         q_start_interp_ = q_current_;
 
         publishTargetMarker(target, status);
-        publishEEPose(ee_pos, status);
+        publishEEPose(ee_pos, ee_rot, status);
         publishCollisionMarker();
     }
 
@@ -159,6 +184,7 @@ private:
     }
 
     Eigen::VectorXd solveIK(const Eigen::Vector3d& target,
+                            const Eigen::Matrix3d& target_rot,
                             const Eigen::VectorXd& q_start,
                             IKStatus* status)
     {
@@ -177,6 +203,8 @@ private:
         double w_prev = get_parameter("weight_prev").as_double();
         double w_pref = get_parameter("weight_pref").as_double();
         double w_drift = get_parameter("weight_drift").as_double();
+        double w_pos_orient = get_parameter("weight_pos").as_double();
+        double w_orient_orient = get_parameter("weight_orient").as_double();
         Eigen::VectorXd q_pref = Eigen::VectorXd::Map(
             get_parameter("preferred_q").as_double_array().data(),
             model_.nv);
@@ -207,8 +235,22 @@ private:
                 pinocchio::forwardKinematics(model_, data_, q);
                 pinocchio::updateFramePlacement(model_, data_, ee_id_);
                 Eigen::Vector3d ee_pos = data_.oMf[ee_id_].translation();
-                Eigen::Vector3d err = target - ee_pos;
-                double err_norm = err.norm();
+                Eigen::Matrix3d ee_rot = data_.oMf[ee_id_].rotation();
+                Eigen::Vector3d e_pos = target - ee_pos;
+                // If target rotation ≈ identity → treat as "no orientation constraint" (backward-compat)
+                Eigen::Vector3d e_rot;
+                if (target_rot.isApprox(Eigen::Matrix3d::Identity(), 1e-6)) {
+                    e_rot = Eigen::Vector3d::Zero();
+                } else {
+                    e_rot = log3_rotation(target_rot * ee_rot.transpose());
+                }
+                Eigen::Matrix<double,6,1> err;
+                err << e_pos, e_rot;
+                // Weighted norm for convergence: position scaled by w_pos, orientation by w_orient
+                Eigen::Matrix<double,6,1> wnorm_diag;
+                wnorm_diag << w_pos_orient, w_pos_orient, w_pos_orient,
+                              w_orient_orient, w_orient_orient, w_orient_orient;
+                double err_norm = (wnorm_diag.asDiagonal() * err).norm();
                 if (err_norm < eps) { converged = true; best_q = q; best_err = err_norm; break; }
                 if (err_norm < best_err) { best_q = q; best_err = err_norm; }
 
@@ -217,20 +259,30 @@ private:
                 pinocchio::computeJointJacobians(model_, data_, q);
                 pinocchio::getFrameJacobian(model_, data_, ee_id_,
                                             pinocchio::LOCAL_WORLD_ALIGNED, J);
-                Eigen::MatrixXd Jp = J.topRows(3);
 
+                // Manipulability (6D Jacobian — full SE(3) task)
                 double mu = std::sqrt(std::max(0.0,
-                    (Jp * Jp.transpose()).determinant()));
+                    (J * J.transpose()).determinant()));
                 double lambda = damp_b + man_k * std::max(0.0, 1.0 - mu / (man_th + 1e-12));
                 lambda = std::min(lambda, 0.5);
 
-                Eigen::Matrix3d JJt = Jp * Jp.transpose();
+                // Weighted DLS on full 6D task: solve (W·J·J^T·W + λ²I) x = W·e
+                Eigen::Matrix<double,6,1> w_diag;
+                w_diag << w_pos_orient, w_pos_orient, w_pos_orient,
+                          w_orient_orient, w_orient_orient, w_orient_orient;
+                Eigen::Matrix<double,6,6> W = w_diag.asDiagonal();
+                Eigen::MatrixXd Jw = W * J;
+                Eigen::Matrix<double,6,6> JJt = Jw * Jw.transpose();
                 JJt.diagonal().array() += lambda * lambda;
-                Eigen::Vector3d x = JJt.ldlt().solve(err);
-                Eigen::VectorXd v_task = Jp.transpose() * x;
+                Eigen::Matrix<double,6,1> x = JJt.ldlt().solve(W * err);
+                Eigen::VectorXd v_task = Jw.transpose() * x;
 
-                Eigen::MatrixXd Jplus = Jp.transpose() * JJt.ldlt().solve(Eigen::Matrix3d::Identity());
-                Eigen::MatrixXd N = Eigen::MatrixXd::Identity(model_.nv, model_.nv) - Jplus * Jp;
+                // Null-space projector uses unweighted Jacobian pseudo-inverse
+                Eigen::Matrix<double,6,6> JJt_uw = J * J.transpose();
+                JJt_uw.diagonal().array() += lambda * lambda;
+                Eigen::MatrixXd Jplus = J.transpose() * JJt_uw.ldlt().solve(
+                    Eigen::Matrix<double,6,6>::Identity());
+                Eigen::MatrixXd N = Eigen::MatrixXd::Identity(model_.nv, model_.nv) - Jplus * J;
 
                 Eigen::VectorXd z = Eigen::VectorXd::Zero(model_.nv);
                 z += w_jc   * (q_mid - q);
@@ -240,7 +292,7 @@ private:
                 if (w_pref > 0.0)
                     z += w_pref * (q_pref - q);
                 if (w_man > 0.0)
-                    z += w_man * numericalManipGradient(Jp, q, man_th);
+                    z += w_man * numericalManipGradient(J.topRows(3), q, man_th);
 
                 // Self-collision CBF barrier — only when distance < d_min + margin
                 if (w_collision > 0.0) {
@@ -544,14 +596,20 @@ private:
         marker_pub_->publish(m);
     }
 
-    void publishEEPose(const Eigen::Vector3d& ee_pos, IKStatus status) {
+    void publishEEPose(const Eigen::Vector3d& ee_pos,
+                       const Eigen::Matrix3d& ee_rot, IKStatus status) {
         geometry_msgs::msg::PoseStamped p;
         p.header.stamp = now();
         p.header.frame_id = "base_link";
         p.pose.position.x = ee_pos.x();
         p.pose.position.y = ee_pos.y();
         p.pose.position.z = ee_pos.z();
-        p.pose.orientation.w = 1.0;
+        Eigen::Quaterniond q_out(ee_rot);
+        q_out.normalize();
+        p.pose.orientation.x = q_out.x();
+        p.pose.orientation.y = q_out.y();
+        p.pose.orientation.z = q_out.z();
+        p.pose.orientation.w = q_out.w();
         ee_pose_pub_->publish(p);
     }
 
@@ -626,7 +684,7 @@ private:
     rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr marker_pub_;
     rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr ee_pose_pub_;
     rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr collision_marker_pub_;
-    rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr target_sub_;
+    rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr target_sub_;
     rclcpp::TimerBase::SharedPtr timer_;
 };
 
