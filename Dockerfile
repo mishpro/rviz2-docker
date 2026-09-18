@@ -21,6 +21,7 @@ WORKDIR /workspace
 RUN git clone https://github.com/TheRobotStudio/SO-ARM100.git
 RUN mkdir -p ros2_ws/src
 COPY app ros2_ws/src/so101_ik
+COPY scripts /workspace/ros2_ws/src/so101_ik/scripts
 WORKDIR /workspace/ros2_ws
 RUN . /opt/ros/jazzy/setup.sh && colcon build --merge-install
 

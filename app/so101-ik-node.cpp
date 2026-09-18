@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <map>
 #include <random>
 #include <Eigen/Dense>
 
@@ -57,12 +58,18 @@ public:
         declare_parameter("weight_man", 0.2);
         declare_parameter("weight_prev", 0.3);
         declare_parameter("weight_pref", 0.5);
+        declare_parameter("weight_drift", 0.1);
         declare_parameter("preferred_q", std::vector<double>{0.0, -0.3, 1.0, -0.7, 0.0, 0.0});
         declare_parameter("ik_stuck_patience", 40);
         declare_parameter("reach_padding", 1e-2);
         declare_parameter("init_target_x", 0.20);
         declare_parameter("init_target_y", 0.0);
         declare_parameter("init_target_z", 0.15);
+        declare_parameter("vel_max", std::vector<double>{1.0, 1.0, 1.0, 1.0, 1.0, 1.0});
+        declare_parameter("mu_boundary", 5.0);
+        declare_parameter("weight_collision", 0.5);
+        declare_parameter("collision_d_min", 0.005);
+        declare_parameter("collision_margin", 0.010);
 
         // Рабочая область: r_max через FK в нескольких позах
         computeWorkspaceRadius();
@@ -82,6 +89,8 @@ public:
         joint_pub_ = create_publisher<sensor_msgs::msg::JointState>("/joint_states", 10);
         marker_pub_ = create_publisher<visualization_msgs::msg::Marker>("/target_marker", 10);
         ee_pose_pub_ = create_publisher<geometry_msgs::msg::PoseStamped>("/ee_pose", 10);
+        collision_marker_pub_ = create_publisher<visualization_msgs::msg::Marker>(
+            "/collision_marker", 10);
 
         // Subscriber
         target_sub_ = create_subscription<geometry_msgs::msg::PointStamped>(
@@ -132,6 +141,7 @@ private:
 
         publishTargetMarker(target, status);
         publishEEPose(ee_pos, status);
+        publishCollisionMarker();
     }
 
     Eigen::Vector3d projectToWorkspace(Eigen::Vector3d target, IKStatus& status) {
@@ -166,10 +176,18 @@ private:
         double w_man  = get_parameter("weight_man").as_double();
         double w_prev = get_parameter("weight_prev").as_double();
         double w_pref = get_parameter("weight_pref").as_double();
+        double w_drift = get_parameter("weight_drift").as_double();
         Eigen::VectorXd q_pref = Eigen::VectorXd::Map(
             get_parameter("preferred_q").as_double_array().data(),
             model_.nv);
         int    stuck_patience = get_parameter("ik_stuck_patience").as_int();
+        Eigen::VectorXd v_max = Eigen::VectorXd::Map(
+            get_parameter("vel_max").as_double_array().data(),
+            model_.nv);
+        double mu_boundary = get_parameter("mu_boundary").as_double();
+        double w_collision     = get_parameter("weight_collision").as_double();
+        double collision_d_min = get_parameter("collision_d_min").as_double();
+        double collision_margin = get_parameter("collision_margin").as_double();
 
         Eigen::VectorXd q_mid = 0.5 * (model_.lowerPositionLimit.array() +
                                        model_.upperPositionLimit.array());
@@ -217,10 +235,32 @@ private:
                 Eigen::VectorXd z = Eigen::VectorXd::Zero(model_.nv);
                 z += w_jc   * (q_mid - q);
                 z += w_prev * (q_start - q);
+                if (w_drift > 0.0)
+                    z += w_drift * (q_start - q);
                 if (w_pref > 0.0)
                     z += w_pref * (q_pref - q);
                 if (w_man > 0.0)
                     z += w_man * numericalManipGradient(Jp, q, man_th);
+
+                // Self-collision CBF barrier — only when distance < d_min + margin
+                if (w_collision > 0.0) {
+                    worst_pair_idx_ = -1;
+                    worst_d_ = std::numeric_limits<double>::infinity();
+                    for (size_t pi = 0; pi < collision_pairs_.size(); ++pi) {
+                        double d = computePairDistance(collision_pairs_[pi].first,
+                                                       collision_pairs_[pi].second);
+                        if (d < collision_d_min && d < worst_d_) {
+                            worst_d_ = d;
+                            worst_pair_idx_ = (int)pi;
+                        }
+                        if (d < collision_d_min + collision_margin) {
+                            // Repulsive: d/dq pulled away when violated
+                            Eigen::VectorXd grad_d = numericalDistanceGradient(
+                                collision_pairs_[pi], q);
+                            z += w_collision * (collision_d_min - d) * grad_d;
+                        }
+                    }
+                }
 
                 Eigen::VectorXd dq = v_task + N * z;
 
@@ -239,6 +279,8 @@ private:
                 dt = std::clamp(dt, dt_min, dt_max);
                 prev_err = err_norm;
 
+                dq = dq.cwiseMin(v_max.cwiseMin(mu_boundary * (model_.upperPositionLimit - q)))
+                       .cwiseMax((-v_max).cwiseMax(mu_boundary * (model_.lowerPositionLimit - q)));
                 q = pinocchio::integrate(model_, q, dt * dq);
                 q = q.cwiseMax(model_.lowerPositionLimit)
                     .cwiseMin(model_.upperPositionLimit);
@@ -342,6 +384,61 @@ private:
         return grad;
     }
 
+    Eigen::Vector3d getLinkPosition(const std::string& link_name) {
+        // Approximate link world position via parent joint origin (oMi).
+        // SO-101 URDF: link name ≠ joint name. Map link → parent joint.
+        static const std::map<std::string, std::string> link_to_joint = {
+            {"base_link", ""},
+            {"shoulder_link", "shoulder_pan"},
+            {"upper_arm_link", "shoulder_lift"},
+            {"lower_arm_link", "elbow_flex"},
+            {"wrist_link", "wrist_flex"},
+            {"gripper_link", "wrist_roll"},
+        };
+        auto it = link_to_joint.find(link_name);
+        if (it == link_to_joint.end()) {
+            throw std::runtime_error("no joint mapping for link: " + link_name);
+        }
+        if (it->second.empty()) return Eigen::Vector3d::Zero();  // base_link root
+        if (!model_.existJointName(it->second)) {
+            throw std::runtime_error("joint not found: " + it->second);
+        }
+        return data_.oMi[model_.getJointId(it->second)].translation();
+    }
+
+    double computePairDistance(const std::string& link_a,
+                                const std::string& link_b) {
+        Eigen::Vector3d pa = getLinkPosition(link_a);
+        Eigen::Vector3d pb = getLinkPosition(link_b);
+        double ra = sphere_radii_.at(link_a);
+        double rb = sphere_radii_.at(link_b);
+        return (pa - pb).norm() - (ra + rb);
+    }
+
+    Eigen::VectorXd numericalDistanceGradient(const std::pair<std::string,std::string>& pair,
+                                               const Eigen::VectorXd& q) {
+        const double h = 1e-3;
+        double d0 = computePairDistance(pair.first, pair.second);
+        Eigen::VectorXd grad = Eigen::VectorXd::Zero(model_.nv);
+        for (int i = 0; i < model_.nv; ++i) {
+            Eigen::VectorXd qp = q; qp[i] += h;
+            Eigen::VectorXd qm = q; qm[i] -= h;
+            qp = qp.cwiseMax(model_.lowerPositionLimit)
+                    .cwiseMin(model_.upperPositionLimit);
+            qm = qm.cwiseMax(model_.lowerPositionLimit)
+                    .cwiseMin(model_.upperPositionLimit);
+            pinocchio::forwardKinematics(model_, data_, qp);
+            double dp = computePairDistance(pair.first, pair.second);
+            pinocchio::forwardKinematics(model_, data_, qm);
+            double dm = computePairDistance(pair.first, pair.second);
+            grad[i] = (dp - dm) / (2.0 * h);
+        }
+        // Restore FK to q for caller
+        pinocchio::forwardKinematics(model_, data_, q);
+        (void)d0;
+        return grad;
+    }
+
     void computeWorkspaceRadius() {
         // Базовая точка — позиция EE при q=neutral
         pinocchio::forwardKinematics(model_, data_, pinocchio::neutral(model_));
@@ -401,8 +498,9 @@ private:
         // Интерполяция к целевой позе
         if (interp_step_ < interp_total_) {
             double alpha = (double)interp_step_ / interp_total_;
-            // Сглаживание (cosine interpolation)
-            double smooth = 0.5 * (1.0 - std::cos(M_PI * alpha));
+            // Сглаживание: quintic min-jerk, C2-гладкая (zero velocity & accel в endpoints)
+            double smooth = alpha * alpha * alpha *
+                            (10.0 - 15.0 * alpha + 6.0 * alpha * alpha);
             q_current_ = q_start_interp_ + smooth * (q_target_ - q_start_interp_);
             q_current_ = q_current_.cwiseMax(model_.lowerPositionLimit)
                 .cwiseMin(model_.upperPositionLimit);
@@ -457,10 +555,63 @@ private:
         ee_pose_pub_->publish(p);
     }
 
+    void publishCollisionMarker() {
+        visualization_msgs::msg::Marker m;
+        m.header.stamp = now();
+        m.header.frame_id = "base_link";
+        m.ns = "self_collision";
+        m.id = 0;
+        m.type = visualization_msgs::msg::Marker::SPHERE;
+        if (worst_pair_idx_ < 0) {
+            // No collision detected — delete marker
+            m.action = visualization_msgs::msg::Marker::DELETE;
+            collision_marker_pub_->publish(m);
+            return;
+        }
+        m.action = visualization_msgs::msg::Marker::ADD;
+        Eigen::Vector3d pa = getLinkPosition(collision_pairs_[worst_pair_idx_].first);
+        Eigen::Vector3d pb = getLinkPosition(collision_pairs_[worst_pair_idx_].second);
+        Eigen::Vector3d mid = 0.5 * (pa + pb);
+        m.pose.position.x = mid.x();
+        m.pose.position.y = mid.y();
+        m.pose.position.z = mid.z();
+        m.pose.orientation.w = 1.0;
+        double penetration = std::max(0.0, -worst_d_);
+        double scale = std::max(0.03, penetration);
+        m.scale.x = m.scale.y = m.scale.z = scale;
+        m.color.r = 0.9; m.color.g = 0.1; m.color.b = 0.1; m.color.a = 1.0;
+        collision_marker_pub_->publish(m);
+    }
+
     // Pinocchio
     pinocchio::Model model_;
     pinocchio::Data data_;
     pinocchio::FrameIndex ee_id_;
+
+    // Self-collision: non-adjacent pairs (link_name, link_name)
+    const std::vector<std::pair<std::string,std::string>> collision_pairs_ = {
+        {"base_link", "lower_arm_link"},
+        {"base_link", "wrist_link"},
+        {"base_link", "gripper_link"},
+        {"shoulder_link", "lower_arm_link"},
+        {"shoulder_link", "wrist_link"},
+        {"upper_arm_link", "wrist_link"},
+        {"upper_arm_link", "gripper_link"},
+        {"lower_arm_link", "gripper_link"},
+    };
+    // Sphere radii per link (hardcoded fallback — URDF <collision> for SO-101
+    // is mostly visual meshes, not analytic primitives)
+    const std::map<std::string, double> sphere_radii_ = {
+        {"base_link", 0.030},
+        {"shoulder_link", 0.025},
+        {"upper_arm_link", 0.022},
+        {"lower_arm_link", 0.020},
+        {"wrist_link", 0.018},
+        {"gripper_link", 0.025},
+    };
+    // Worst self-collision pair in current IK iteration (for marker)
+    int worst_pair_idx_ = -1;
+    double worst_d_ = std::numeric_limits<double>::infinity();
     std::vector<std::string> joint_names_;
     Eigen::VectorXd q_current_;
     Eigen::VectorXd q_target_;
@@ -474,6 +625,7 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr joint_pub_;
     rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr marker_pub_;
     rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr ee_pose_pub_;
+    rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr collision_marker_pub_;
     rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr target_sub_;
     rclcpp::TimerBase::SharedPtr timer_;
 };
