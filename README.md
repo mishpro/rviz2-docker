@@ -140,6 +140,10 @@ Standalone Python node для ручного тестирования:
 ```bash
 python3 scripts/teleop_keyboard.py
 ```
+внутри контейнера. Или выполнить на хосте для входа в контейнер с последующим запуском телеопа:
+```
+docker exec -it so101-dev bash -c "python3 /workspace/ros2_ws/src/so101_ik/scripts/teleop_keyboard.py"
+```
 
 Клавиши:
 ```
