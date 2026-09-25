@@ -580,7 +580,7 @@ private:
         m.pose.position.y = pos.y();
         m.pose.position.z = pos.z();
         m.pose.orientation.w = 1.0;
-        m.scale.x = m.scale.y = m.scale.z = 0.03;
+        m.scale.x = m.scale.y = m.scale.z = 0.01;
         switch (status) {
             case IKStatus::Converged:
                 m.color.r = 0.2; m.color.g = 0.9; m.color.b = 0.2; break;
