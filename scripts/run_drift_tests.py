@@ -37,7 +37,7 @@ ARM_JOINTS = 5
 
 # Default loop parameters (rviz2-docker reachable workspace, around 0.25 m
 # from base, well inside the 0.48 m r_max reported in README).
-DEFAULT_CENTER = (0.25, 0.0, 0.15)
+DEFAULT_CENTER = (0.25, 0.0, 0.0)
 CIRCLE_RADIUS = 0.05      # m
 SQUARE_HALF = 0.04        # m
 
