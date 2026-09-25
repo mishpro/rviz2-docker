@@ -60,6 +60,24 @@ def circle_xz_loop(center, radius, n_points):
     return pts
 
 
+def circle_xy_loop(center, radius, n_points):
+    """Closed loop on a horizontal circle in XY plane (Z constant).
+
+    Starts at (cx + r, cy, cz), walks counterclockwise, returns to start.
+    n_points is the number of distinct waypoints; the closing point is
+    appended automatically so the loop is truly closed.
+    """
+    cx, cy, cz = center
+    pts = [
+        (cx + radius * math.cos(2 * math.pi * i / n_points),
+         cy + radius * math.sin(2 * math.pi * i / n_points),
+         cz)
+        for i in range(n_points)
+    ]
+    pts.append(pts[0])
+    return pts
+
+
 def square_xy_loop(center, half_size, n_per_side):
     """Closed loop on a square in XY plane, walked clockwise.
 
@@ -204,9 +222,9 @@ def main():
     parser = argparse.ArgumentParser(
         description='Drift-free tests for SO-101 IK (rviz2-docker).')
     parser.add_argument('--shape', default='all',
-                        choices=['circle-xz', 'square-xy', 'all'])
+                        choices=['circle-xz', 'circle-xy', 'square-xy', 'all'])
     parser.add_argument('--n-points', type=int, default=16,
-                        help='Number of points for circle-xz (default 16)')
+                        help='Number of points for circle-* (default 16)')
     parser.add_argument('--n-per-side', type=int, default=5,
                         help='Number of points per side for square-xy (default 5)')
     parser.add_argument('--threshold', type=float, default=0.05,
@@ -230,11 +248,13 @@ def main():
     all_ok = True
     try:
         center = tuple(args.center)
-        shapes = (['circle-xz', 'square-xy']
+        shapes = (['circle-xz', 'circle-xy', 'square-xy']
                   if args.shape == 'all' else [args.shape])
         for shape in shapes:
             if shape == 'circle-xz':
                 points = circle_xz_loop(center, CIRCLE_RADIUS, args.n_points)
+            elif shape == 'circle-xy':
+                points = circle_xy_loop(center, CIRCLE_RADIUS, args.n_points)
             else:
                 points = square_xy_loop(center, SQUARE_HALF, args.n_per_side)
             ok = tester.run_shape(shape, points, args.threshold, args.baseline,
