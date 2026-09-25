@@ -28,7 +28,7 @@ import time
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
-from geometry_msgs.msg import PointStamped
+from geometry_msgs.msg import PoseStamped
 
 
 # Number of arm joints to capture (excluding gripper, matching rviz2-docker
@@ -94,7 +94,7 @@ class DriftTester(Node):
         super().__init__('drift_tester')
         self.sub = self.create_subscription(
             JointState, '/joint_states', self._cb, 10)
-        self.pub = self.create_publisher(PointStamped, '/target_pose', 10)
+        self.pub = self.create_publisher(PoseStamped, '/target_pose', 10)
         self.latest_q = None
         self.joint_names = None
 
@@ -123,11 +123,15 @@ class DriftTester(Node):
             )
 
     def publish_point(self, x, y, z):
-        msg = PointStamped()
+        msg = PoseStamped()
         msg.header.frame_id = 'base_link'
-        msg.point.x = float(x)
-        msg.point.y = float(y)
-        msg.point.z = float(z)
+        msg.pose.position.x = float(x)
+        msg.pose.position.y = float(y)
+        msg.pose.position.z = float(z)
+        msg.pose.orientation.x = 0.0
+        msg.pose.orientation.y = 0.0
+        msg.pose.orientation.z = 0.0
+        msg.pose.orientation.w = 1.0
         self.pub.publish(msg)
         self.spin_for(0.02)
 
