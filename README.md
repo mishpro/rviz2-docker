@@ -53,6 +53,7 @@ URDF: `/workspace/SO-ARM100/Simulation/SO101/so101_new_calib.urdf` (монтир
 | 16 | 6D error + weighted DLS (см. §1) | `solveIK()` | `weight_pos` = 1.0, `weight_orient` = 1.0 |
 | 17 | Мягкая классификация результата | `solveIK()` | `ik_eps` = 1e-4, `ik_eps_visual` = 0.01 |
 | 18 | **Quintic min-jerk smoother** (interpolation в `timerCallback`) | `timerCallback()` | `interp_steps` = 100 |
+| 19 | **5×6 DLS + null-space fix для gripper** | `solveIK()` | `gripper_mode` = "hold", `weight_gripper` = 5.0 |
 
 ---
 
@@ -184,6 +185,8 @@ ros2 param list /so101_ik_node
 ros2 param set /so101_ik_node weight_pref 0.3
 ros2 param set /so101_ik_node weight_orient 0.5       # 6D orientation weight
 ros2 param set /so101_ik_node vel_max "[2.0, 2.0, ...]" # увеличить velocity limit
+ros2 param set /so101_ik_node gripper_mode free       # разморозить gripper (как до фикса)
+ros2 param set /so101_ik_node weight_gripper 10.0     # сильнее тянуть gripper к q_start
 ```
 
 Полный список параметров — в `app/so101-ik-node.cpp` (`declare_parameter` в конструкторе).
@@ -211,6 +214,8 @@ ros2 param set /so101_ik_node vel_max "[2.0, 2.0, ...]" # увеличить vel
 | `ik_stuck_patience` | 40 | итераций до объявления "stuck" |
 | `reach_padding` | 0.01 | padding для workspace projection |
 | `init_target_x/y/z` | 0.20, 0.0, 0.15 | начальная IK-поза при старте |
+| `gripper_mode` | `"hold"` | "hold" фиксирует gripper (q[5]) в q_start через null-space; "free" — как раньше (управляется DLS) |
+| `weight_gripper` | 5.0 | сила null-space фиксации gripper (только при hold) |
 
 ---
 
@@ -223,6 +228,7 @@ ros2 param set /so101_ik_node vel_max "[2.0, 2.0, ...]" # увеличить vel
 5. **Numerical gradient** для self-collision — finite differences с h=1e-3. Шумный у сингулярностей.
 6. **`preferred_q` подобран под SO-101**. Для другой морфологии манипулятора нужно пересмотреть.
 7. **Joint-origin как link center** для sphere collision check. Sphere radius покрывает бо́льшую область → более консервативная оценка.
+8. **5-DOF IK** (3 trans + 2 rot): yaw-компонента ориентации не управляется. Выбор 5×6 обусловлен тем, что 6-DOF/6-task без redundancy → gripper (q[5]) получал dq от DLS и дёргался непредсказуемо. Через null-space `z(5) = w_gripper · (q_start[5] − q[5])` gripper фиксируется (`gripper_mode=hold`). При `gripper_mode=free` поведение — как до фикса (но yaw всё равно не управляется). Управление раскрытием/закрытием схвата требует отдельного топика/команды (TODO).
 
 ---
 

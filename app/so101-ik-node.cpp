@@ -85,6 +85,8 @@ public:
         declare_parameter("weight_collision", 0.5);
         declare_parameter("collision_d_min", 0.005);
         declare_parameter("collision_margin", 0.010);
+        declare_parameter("gripper_mode", std::string("hold"));  // "hold" или "free"
+        declare_parameter("weight_gripper", 5.0);                // null-space тяга к q_start[5]
         declare_parameter("weight_pos", 1.0);
         declare_parameter("weight_orient", 1.0);
 
@@ -216,6 +218,8 @@ private:
         double w_collision     = get_parameter("weight_collision").as_double();
         double collision_d_min = get_parameter("collision_d_min").as_double();
         double collision_margin = get_parameter("collision_margin").as_double();
+        std::string gripper_mode = get_parameter("gripper_mode").as_string();
+        double w_gripper = get_parameter("weight_gripper").as_double();
 
         Eigen::VectorXd q_mid = 0.5 * (model_.lowerPositionLimit.array() +
                                        model_.upperPositionLimit.array());
@@ -244,12 +248,14 @@ private:
                 } else {
                     e_rot = log3_rotation(target_rot * ee_rot.transpose());
                 }
-                Eigen::Matrix<double,6,1> err;
-                err << e_pos, e_rot;
-                // Weighted norm for convergence: position scaled by w_pos, orientation by w_orient
-                Eigen::Matrix<double,6,1> wnorm_diag;
+                // 5-DOF task (3 trans + 2 rot, drop e_rot.z yaw):
+                // gives redundancy = 1 (nv=6 - rank=5), allowing null-space fix
+                // for the gripper joint (q[5]).
+                Eigen::Matrix<double,5,1> err;
+                err << e_pos, e_rot.head<2>();
+                Eigen::Matrix<double,5,1> wnorm_diag;
                 wnorm_diag << w_pos_orient, w_pos_orient, w_pos_orient,
-                              w_orient_orient, w_orient_orient, w_orient_orient;
+                              w_orient_orient, w_orient_orient;
                 double err_norm = (wnorm_diag.asDiagonal() * err).norm();
                 if (err_norm < eps) { converged = true; best_q = q; best_err = err_norm; break; }
                 if (err_norm < best_err) { best_q = q; best_err = err_norm; }
@@ -259,36 +265,42 @@ private:
                 pinocchio::computeJointJacobians(model_, data_, q);
                 pinocchio::getFrameJacobian(model_, data_, ee_id_,
                                             pinocchio::LOCAL_WORLD_ALIGNED, J);
+                // Редуцированный Якобиан: 5 строк (3 trans + 2 rot, без yaw)
+                Eigen::MatrixXd J5 = J.topRows<5>();
 
-                // Manipulability (6D Jacobian — full SE(3) task)
+                // Manipulability (по 5×5 Якобиану — задача SE(3) без yaw)
                 double mu = std::sqrt(std::max(0.0,
-                    (J * J.transpose()).determinant()));
+                    (J5 * J5.transpose()).determinant()));
                 double lambda = damp_b + man_k * std::max(0.0, 1.0 - mu / (man_th + 1e-12));
                 lambda = std::min(lambda, 0.5);
 
-                // Weighted DLS on full 6D task: solve (W·J·J^T·W + λ²I) x = W·e
-                Eigen::Matrix<double,6,1> w_diag;
+                // Weighted DLS на 5-DOF задаче: решаем (W·J5·J5ᵀ·W + λ²I) x = W·e
+                Eigen::Matrix<double,5,1> w_diag;
                 w_diag << w_pos_orient, w_pos_orient, w_pos_orient,
-                          w_orient_orient, w_orient_orient, w_orient_orient;
-                Eigen::Matrix<double,6,6> W = w_diag.asDiagonal();
-                Eigen::MatrixXd Jw = W * J;
-                Eigen::Matrix<double,6,6> JJt = Jw * Jw.transpose();
+                          w_orient_orient, w_orient_orient;
+                Eigen::Matrix<double,5,5> W = w_diag.asDiagonal();
+                Eigen::MatrixXd Jw = W * J5;
+                Eigen::Matrix<double,5,5> JJt = Jw * Jw.transpose();
                 JJt.diagonal().array() += lambda * lambda;
-                Eigen::Matrix<double,6,1> x = JJt.ldlt().solve(W * err);
-                Eigen::VectorXd v_task = Jw.transpose() * x;
+                Eigen::Matrix<double,5,1> x = JJt.ldlt().solve(W * err);
+                Eigen::VectorXd v_task = Jw.transpose() * x;  // size 6
 
-                // Null-space projector uses unweighted Jacobian pseudo-inverse
-                Eigen::Matrix<double,6,6> JJt_uw = J * J.transpose();
+                // Null-space проектор через unweighted 5×6 псевдообратный Якобиан
+                Eigen::Matrix<double,5,5> JJt_uw = J5 * J5.transpose();
                 JJt_uw.diagonal().array() += lambda * lambda;
-                Eigen::MatrixXd Jplus = J.transpose() * JJt_uw.ldlt().solve(
-                    Eigen::Matrix<double,6,6>::Identity());
-                Eigen::MatrixXd N = Eigen::MatrixXd::Identity(model_.nv, model_.nv) - Jplus * J;
+                Eigen::MatrixXd Jplus = J5.transpose() * JJt_uw.ldlt().solve(
+                    Eigen::Matrix<double,5,5>::Identity());
+                // N = I - J5⁺·J5 — проектор на null-space (rank 1)
+                Eigen::MatrixXd N = Eigen::MatrixXd::Identity(model_.nv, model_.nv) - Jplus * J5;
 
                 Eigen::VectorXd z = Eigen::VectorXd::Zero(model_.nv);
                 z += w_jc   * (q_mid - q);
                 z += w_prev * (q_start - q);
                 if (w_drift > 0.0)
                     z += w_drift * (q_start - q);
+                // Null-space фиксация gripper (q[5]) — тянем к q_start[5]
+                if (gripper_mode == "hold")
+                    z(5) += w_gripper * (q_start[5] - q[5]);
                 if (w_pref > 0.0)
                     z += w_pref * (q_pref - q);
                 if (w_man > 0.0)
