@@ -12,12 +12,12 @@ URDF: `/workspace/SO-ARM100/Simulation/SO101/so101_new_calib.urdf` (монтир
 Базовый алгоритм — **Damped Least Squares (DLS)** в операционном пространстве (CLIK) с **task priority** на двух разных фреймах:
 
 1. **Два EE-фрейма**:
-   - `gripper_link` — **для position task** (на оси `wrist_roll`, не сдвигается при вращении кисти).
+   - `gripper_link` — **для position task** (на оси `wrist_roll`, не сдвигается при вращении кисти). Также используется для `flipShoulderPan`, `computeWorkspaceRadius`, `numericalManipGradient` — все они должны быть согласованы с position task.
    - `gripper_frame_link` — **для orientation task** (на конце кисти, ~10 см впереди, смещён от оси вращения). Используется также для публикации `/ee_pose`.
 2. **Прямая кинематика** → `ee_pos_pos = oMf[gripper_link].translation`, `ee_rot_curr = oMf[gripper_frame_link].rotation`.
 3. **Position error**: `e_pos = target_pos − ee_pos_pos` (3×1).
-4. **Backward-compat**: если `R_target ≈ I` (identity quaternion), orientation task пропускается → только position control.
-5. **Orientation error**: `e_rot = log3(R_target · R_rot_currᵀ)` (3×1, axis-angle).
+4. **Orientation error**: `e_rot = log3(R_target · R_rot_currᵀ)` (3×1, axis-angle). ВСЕГДА вычисляется для convergence check.
+5. **Backward-compat**: если `R_target ≈ I` (identity quaternion), orientation DLS **пропускается** (`v_task = dq_pos`), но `e_rot` всё равно вычисляется (нулевой) → только position control.
 6. **Position Jacobian** (3×6) — линейная часть для `gripper_link` через `getFrameJacobian(LOCAL_WORLD_ALIGNED)`.
 7. **Position DLS**: `dq_pos = J_pos^T · (J_pos · J_pos^T + λ²I)⁻¹ · e_pos` (точно решает позицию).
 8. **Null-space проектор**: `N_pos = I − J_pos⁺ · J_pos` (ранг 3).
@@ -32,7 +32,7 @@ URDF: `/workspace/SO-ARM100/Simulation/SO101/so101_new_calib.urdf` (монтир
     ```
     `z(5)` — null-space критерий для фиксации gripper (q[5] = `moving_jaw`).
 11. **Шаг**: `q ← integrate(q, dt · (v_task + N_pos · z))`, затем velocity clamp + CBF joint bounds + position clip.
-12. Итерации до сходимости (`‖e_pos‖ < ik_eps`) или исчерпания `ik_max_iter`.
+12. **Convergence**: `‖e_pos‖ < ik_eps AND ‖e_rot‖ < ik_eps`. Position решается точно, orientation — насколько достижимо в null-space (зависит от redundancy).
 
 ---
 
@@ -58,7 +58,7 @@ URDF: `/workspace/SO-ARM100/Simulation/SO101/so101_new_calib.urdf` (монтир
 | 16 | 6D error + weighted DLS (см. §1) | `solveIK()` | `weight_pos` = 1.0, `weight_orient` = 1.0 |
 | 17 | Мягкая классификация результата | `solveIK()` | `ik_eps` = 1e-4, `ik_eps_visual` = 0.01 |
 | 18 | **Quintic min-jerk smoother** (interpolation в `timerCallback`) | `timerCallback()` | `interp_steps` = 100 |
-| 19 | **Task priority IK**: position (gripper_link) → orientation (gripper_frame_link) в null-space | `solveIK()` | `ee_pos_id`="gripper_link", `ee_rot_id`="gripper_frame_link" |
+| 19 | **Task priority IK**: position (gripper_link) → orientation (gripper_frame_link) в null-space; convergence по обеим задачам | `solveIK()` | `ee_pos_id`="gripper_link", `ee_rot_id`="gripper_frame_link" |
 | 20 | **Null-space фиксация gripper (q[5] = moving_jaw)** | `solveIK()` | `gripper_mode` = "hold", `weight_gripper` = 5.0 |
 
 ---

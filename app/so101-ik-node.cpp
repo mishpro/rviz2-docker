@@ -152,14 +152,16 @@ private:
 
         pinocchio::forwardKinematics(model_, data_, q);
         pinocchio::updateFramePlacements(model_, data_);
-        Eigen::Vector3d pos_check = data_.oMf[ee_pos_id_].translation();  // gripper_link — position task
-        Eigen::Matrix3d rot_check = data_.oMf[ee_rot_id_].rotation();     // gripper_frame_link — orientation task
+        // Публикуем gripper_frame_link целиком (позу + ориентацию одного фрейма)
+        Eigen::Vector3d pos_check = data_.oMf[ee_rot_id_].translation();
+        Eigen::Matrix3d rot_check = data_.oMf[ee_rot_id_].rotation();
         const char* st = (status == IKStatus::Converged)   ? "converged"
                        : (status == IKStatus::Approximate) ? "approximate"
                        : (status == IKStatus::Projected)   ? "projected" : "failed";
-        Eigen::Vector3d pos_err = target - pos_check;
+        Eigen::Vector3d gripper_link_pos = data_.oMf[ee_pos_id_].translation();
+        Eigen::Vector3d pos_err = target - gripper_link_pos;
         Eigen::Vector3d rot_err = log3_rotation(target_rot * rot_check.transpose());
-        RCLCPP_INFO(get_logger(), "IK %s, gripper_link pos err=%.4f rot err=%.4f (rad)",
+        RCLCPP_INFO(get_logger(), "IK %s, gripper_link pos err=%.4f gripper_frame rot err=%.4f (rad)",
                     st, pos_err.norm(), rot_err.norm());
 
         q_target_ = q;
@@ -247,6 +249,20 @@ private:
                 Eigen::Vector3d ee_pos_pos = data_.oMf[ee_pos_id_].translation();
                 Eigen::Vector3d e_pos = target - ee_pos_pos;
 
+                // Ориентация ВСЕГДА вычисляется (для convergence check)
+                Eigen::Matrix3d ee_rot_curr = data_.oMf[ee_rot_id_].rotation();
+                Eigen::Vector3d e_rot = log3_rotation(target_rot * ee_rot_curr.transpose());
+
+                // === Convergence check по ОБЕИМ задачам ===
+                double pos_err_norm = e_pos.norm();
+                double rot_err_norm = e_rot.norm();
+                double combined_err = pos_err_norm + 0.5 * rot_err_norm;
+
+                if (pos_err_norm < eps && rot_err_norm < eps) {
+                    converged = true; best_q = q; best_err = combined_err; break;
+                }
+                if (combined_err < best_err) { best_q = q; best_err = combined_err; }
+
                 pinocchio::computeJointJacobians(model_, data_, q);
                 Eigen::MatrixXd J_pos_full(6, model_.nv);
                 J_pos_full.setZero();
@@ -255,18 +271,13 @@ private:
                 // Только линейная часть (3 trans)
                 Eigen::MatrixXd J_pos = J_pos_full.topRows(3);
 
-                // Convergence check (только по позиции — position имеет приоритет)
-                double err_norm = e_pos.norm();
-                if (err_norm < eps) { converged = true; best_q = q; best_err = err_norm; break; }
-                if (err_norm < best_err) { best_q = q; best_err = err_norm; }
-
                 // Manipulability по position 3×3 Якобиану
                 double mu = std::sqrt(std::max(0.0,
                     (J_pos * J_pos.transpose()).determinant()));
                 double lambda = damp_b + man_k * std::max(0.0, 1.0 - mu / (man_th + 1e-12));
                 lambda = std::min(lambda, 0.5);
 
-                // Шаг 1: DLS по позиции (3-DOF task)
+                // Шаг 1: DLS по позиции (3-DOF task) — решается точно
                 Eigen::Matrix3d JJt_pos = J_pos * J_pos.transpose();
                 JJt_pos.diagonal().array() += lambda * lambda;
                 Eigen::Vector3d x_pos = JJt_pos.ldlt().solve(e_pos);
@@ -278,17 +289,14 @@ private:
                 Eigen::MatrixXd N_pos = Eigen::MatrixXd::Identity(model_.nv, model_.nv)
                                        - J_pos_pinv * J_pos;
 
-                // Шаг 2: ориентация gripper_frame_link в null-space позиции
+                // Шаг 2: ориентация в null-space позиции (только если target_rot ≠ identity)
                 Eigen::VectorXd v_task = dq_pos;
                 if (!target_rot.isApprox(Eigen::Matrix3d::Identity(), 1e-6)) {
-                    Eigen::Matrix3d ee_rot_curr = data_.oMf[ee_rot_id_].rotation();
-                    Eigen::Vector3d e_rot = log3_rotation(target_rot * ee_rot_curr.transpose());
-
+                    // Якобиан gripper_frame_link (угловая часть)
                     Eigen::MatrixXd J_rot_full(6, model_.nv);
                     J_rot_full.setZero();
                     pinocchio::getFrameJacobian(model_, data_, ee_rot_id_,
                                                 pinocchio::LOCAL_WORLD_ALIGNED, J_rot_full);
-                    // Только угловая часть (3 rot)
                     Eigen::MatrixXd J_rot = J_rot_full.bottomRows(3);
 
                     // Проецируем в null-space позиции
@@ -338,7 +346,7 @@ private:
 
                 Eigen::VectorXd dq = v_task + N_pos * z;
 
-                if (err_norm > prev_err) {
+                if (combined_err > prev_err) {
                     dt *= 0.8;
                     ++stuck_count;
                 } else {
@@ -347,11 +355,12 @@ private:
                 }
                 if (stuck_count > stuck_patience) {
                     RCLCPP_DEBUG(get_logger(),
-                        "IK stuck at iter %d (err=%.4f)", i, err_norm);
+                        "IK stuck at iter %d (pos_err=%.4f rot_err=%.4f)",
+                        i, pos_err_norm, rot_err_norm);
                     break;
                 }
                 dt = std::clamp(dt, dt_min, dt_max);
-                prev_err = err_norm;
+                prev_err = combined_err;
 
                 dq = dq.cwiseMin(v_max.cwiseMin(mu_boundary * (model_.upperPositionLimit - q)))
                        .cwiseMax((-v_max).cwiseMax(mu_boundary * (model_.lowerPositionLimit - q)));
@@ -408,8 +417,8 @@ private:
         pinocchio::JointIndex sp = model_.getJointId("shoulder_pan");
 
         pinocchio::forwardKinematics(model_, data_, q);
-        pinocchio::updateFramePlacement(model_, data_, ee_id_);
-        Eigen::Vector3d ee_dir = (data_.oMf[ee_id_].translation() - base_pos_).normalized();
+        pinocchio::updateFramePlacement(model_, data_, ee_pos_id_);
+        Eigen::Vector3d ee_dir = (data_.oMf[ee_pos_id_].translation() - base_pos_).normalized();
         Eigen::Vector3d tgt_dir = (target - base_pos_).normalized();
 
         double dot = ee_dir.dot(tgt_dir);
@@ -438,7 +447,7 @@ private:
         auto mu_of = [&](const Eigen::VectorXd& qq) -> double {
             Eigen::MatrixXd J(6, model_.nv); J.setZero();
             pinocchio::computeJointJacobians(model_, data_, qq);
-            pinocchio::getFrameJacobian(model_, data_, ee_id_,
+            pinocchio::getFrameJacobian(model_, data_, ee_pos_id_,
                                         pinocchio::LOCAL_WORLD_ALIGNED, J);
             Eigen::MatrixXd Jp_ = J.topRows(3);
             return std::sqrt(std::max(0.0, (Jp_ * Jp_.transpose()).determinant()));
@@ -514,10 +523,10 @@ private:
     }
 
     void computeWorkspaceRadius() {
-        // Базовая точка — позиция EE при q=neutral
+        // Базовая точка — позиция gripper_link при q=neutral
         pinocchio::forwardKinematics(model_, data_, pinocchio::neutral(model_));
-        pinocchio::updateFramePlacement(model_, data_, ee_id_);
-        base_pos_ = data_.oMf[ee_id_].translation();
+        pinocchio::updateFramePlacement(model_, data_, ee_pos_id_);
+        base_pos_ = data_.oMf[ee_pos_id_].translation();
 
         // Оценка r_max: FK при полностью вытянутом локте
         Eigen::VectorXd q_ext = pinocchio::neutral(model_);
@@ -533,8 +542,8 @@ private:
                     .cwiseMin(model_.upperPositionLimit);
 
         pinocchio::forwardKinematics(model_, data_, q_ext);
-        pinocchio::updateFramePlacement(model_, data_, ee_id_);
-        double r_ext = (data_.oMf[ee_id_].translation() - base_pos_).norm();
+        pinocchio::updateFramePlacement(model_, data_, ee_pos_id_);
+        double r_ext = (data_.oMf[ee_pos_id_].translation() - base_pos_).norm();
 
         // Длина кинематической цепи по смещениям суставов (НЕ центры масс)
         double link_sum = 0.0;
@@ -555,8 +564,8 @@ private:
                                    model_.lowerPositionLimit[i]);
             }
             pinocchio::forwardKinematics(model_, data_, q);
-            pinocchio::updateFramePlacement(model_, data_, ee_id_);
-            double r = (data_.oMf[ee_id_].translation() - base_pos_).norm();
+            pinocchio::updateFramePlacement(model_, data_, ee_pos_id_);
+            double r = (data_.oMf[ee_pos_id_].translation() - base_pos_).norm();
             r_sampled = std::max(r_sampled, r);
         }
 
