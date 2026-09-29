@@ -45,7 +45,9 @@ public:
         pinocchio::urdf::buildModel(urdf_path, model_);
         data_ = pinocchio::Data(model_);
 
-        ee_id_ = model_.getFrameId("gripper_frame_link");
+        ee_id_ = model_.getFrameId("gripper_frame_link");  // backward-compat для /ee_pose
+        ee_pos_id_ = model_.getFrameId("gripper_link");     // position task
+        ee_rot_id_ = model_.getFrameId("gripper_frame_link");  // orientation task + /ee_pose
         q_current_ = pinocchio::neutral(model_);
         q_target_ = q_current_;
         q_start_interp_ = q_current_;
@@ -149,15 +151,15 @@ private:
         Eigen::VectorXd q = solveIK(target, target_rot, q_current_, &status);
 
         pinocchio::forwardKinematics(model_, data_, q);
-        pinocchio::updateFramePlacement(model_, data_, ee_id_);
-        Eigen::Vector3d ee_pos = data_.oMf[ee_id_].translation();
-        Eigen::Matrix3d ee_rot = data_.oMf[ee_id_].rotation();
+        pinocchio::updateFramePlacements(model_, data_);
+        Eigen::Vector3d pos_check = data_.oMf[ee_pos_id_].translation();  // gripper_link — position task
+        Eigen::Matrix3d rot_check = data_.oMf[ee_rot_id_].rotation();     // gripper_frame_link — orientation task
         const char* st = (status == IKStatus::Converged)   ? "converged"
                        : (status == IKStatus::Approximate) ? "approximate"
                        : (status == IKStatus::Projected)   ? "projected" : "failed";
-        Eigen::Vector3d pos_err = target - ee_pos;
-        Eigen::Vector3d rot_err = log3_rotation(target_rot * ee_rot.transpose());
-        RCLCPP_INFO(get_logger(), "IK %s, final EE pos err=%.4f rot err=%.4f (rad)",
+        Eigen::Vector3d pos_err = target - pos_check;
+        Eigen::Vector3d rot_err = log3_rotation(target_rot * rot_check.transpose());
+        RCLCPP_INFO(get_logger(), "IK %s, gripper_link pos err=%.4f rot err=%.4f (rad)",
                     st, pos_err.norm(), rot_err.norm());
 
         q_target_ = q;
@@ -167,7 +169,7 @@ private:
         q_start_interp_ = q_current_;
 
         publishTargetMarker(target, status);
-        publishEEPose(ee_pos, ee_rot, status);
+        publishEEPose(pos_check, rot_check, status);
         publishCollisionMarker();
     }
 
@@ -237,74 +239,82 @@ private:
 
             for (int i = 0; i < max_iter; ++i) {
                 pinocchio::forwardKinematics(model_, data_, q);
-                pinocchio::updateFramePlacement(model_, data_, ee_id_);
-                Eigen::Vector3d ee_pos = data_.oMf[ee_id_].translation();
-                Eigen::Matrix3d ee_rot = data_.oMf[ee_id_].rotation();
-                Eigen::Vector3d e_pos = target - ee_pos;
-                // If target rotation ≈ identity → treat as "no orientation constraint" (backward-compat)
-                Eigen::Vector3d e_rot;
-                if (target_rot.isApprox(Eigen::Matrix3d::Identity(), 1e-6)) {
-                    e_rot = Eigen::Vector3d::Zero();
-                } else {
-                    e_rot = log3_rotation(target_rot * ee_rot.transpose());
-                }
-                // 5-DOF task (3 trans + 2 rot, drop e_rot.z yaw):
-                // gives redundancy = 1 (nv=6 - rank=5), allowing null-space fix
-                // for the gripper joint (q[5]).
-                Eigen::Matrix<double,5,1> err;
-                err << e_pos, e_rot.head<2>();
-                Eigen::Matrix<double,5,1> wnorm_diag;
-                wnorm_diag << w_pos_orient, w_pos_orient, w_pos_orient,
-                              w_orient_orient, w_orient_orient;
-                double err_norm = (wnorm_diag.asDiagonal() * err).norm();
+                pinocchio::updateFramePlacements(model_, data_);
+
+                // === TASK PRIORITY IK ===
+                // Приоритет 1: позиция gripper_link (на оси wrist_roll) → target
+                // Приоритет 2: ориентация gripper_frame_link (на конце) → target_rot (в null-space позиции)
+                Eigen::Vector3d ee_pos_pos = data_.oMf[ee_pos_id_].translation();
+                Eigen::Vector3d e_pos = target - ee_pos_pos;
+
+                pinocchio::computeJointJacobians(model_, data_, q);
+                Eigen::MatrixXd J_pos_full(6, model_.nv);
+                J_pos_full.setZero();
+                pinocchio::getFrameJacobian(model_, data_, ee_pos_id_,
+                                            pinocchio::LOCAL_WORLD_ALIGNED, J_pos_full);
+                // Только линейная часть (3 trans)
+                Eigen::MatrixXd J_pos = J_pos_full.topRows(3);
+
+                // Convergence check (только по позиции — position имеет приоритет)
+                double err_norm = e_pos.norm();
                 if (err_norm < eps) { converged = true; best_q = q; best_err = err_norm; break; }
                 if (err_norm < best_err) { best_q = q; best_err = err_norm; }
 
-                Eigen::MatrixXd J(6, model_.nv);
-                J.setZero();
-                pinocchio::computeJointJacobians(model_, data_, q);
-                pinocchio::getFrameJacobian(model_, data_, ee_id_,
-                                            pinocchio::LOCAL_WORLD_ALIGNED, J);
-                // Редуцированный Якобиан: 5 строк (3 trans + 2 rot, без yaw)
-                Eigen::MatrixXd J5 = J.topRows<5>();
-
-                // Manipulability (по 5×5 Якобиану — задача SE(3) без yaw)
+                // Manipulability по position 3×3 Якобиану
                 double mu = std::sqrt(std::max(0.0,
-                    (J5 * J5.transpose()).determinant()));
+                    (J_pos * J_pos.transpose()).determinant()));
                 double lambda = damp_b + man_k * std::max(0.0, 1.0 - mu / (man_th + 1e-12));
                 lambda = std::min(lambda, 0.5);
 
-                // Weighted DLS на 5-DOF задаче: решаем (W·J5·J5ᵀ·W + λ²I) x = W·e
-                Eigen::Matrix<double,5,1> w_diag;
-                w_diag << w_pos_orient, w_pos_orient, w_pos_orient,
-                          w_orient_orient, w_orient_orient;
-                Eigen::Matrix<double,5,5> W = w_diag.asDiagonal();
-                Eigen::MatrixXd Jw = W * J5;
-                Eigen::Matrix<double,5,5> JJt = Jw * Jw.transpose();
-                JJt.diagonal().array() += lambda * lambda;
-                Eigen::Matrix<double,5,1> x = JJt.ldlt().solve(W * err);
-                Eigen::VectorXd v_task = Jw.transpose() * x;  // size 6
+                // Шаг 1: DLS по позиции (3-DOF task)
+                Eigen::Matrix3d JJt_pos = J_pos * J_pos.transpose();
+                JJt_pos.diagonal().array() += lambda * lambda;
+                Eigen::Vector3d x_pos = JJt_pos.ldlt().solve(e_pos);
+                Eigen::VectorXd dq_pos = J_pos.transpose() * x_pos;  // size 6
 
-                // Null-space проектор через unweighted 5×6 псевдообратный Якобиан
-                Eigen::Matrix<double,5,5> JJt_uw = J5 * J5.transpose();
-                JJt_uw.diagonal().array() += lambda * lambda;
-                Eigen::MatrixXd Jplus = J5.transpose() * JJt_uw.ldlt().solve(
-                    Eigen::Matrix<double,5,5>::Identity());
-                // N = I - J5⁺·J5 — проектор на null-space (rank 1)
-                Eigen::MatrixXd N = Eigen::MatrixXd::Identity(model_.nv, model_.nv) - Jplus * J5;
+                // Null-space проектор для позиции (rank 3)
+                Eigen::MatrixXd J_pos_pinv = J_pos.transpose() * JJt_pos.ldlt().solve(
+                    Eigen::Matrix3d::Identity());
+                Eigen::MatrixXd N_pos = Eigen::MatrixXd::Identity(model_.nv, model_.nv)
+                                       - J_pos_pinv * J_pos;
+
+                // Шаг 2: ориентация gripper_frame_link в null-space позиции
+                Eigen::VectorXd v_task = dq_pos;
+                if (!target_rot.isApprox(Eigen::Matrix3d::Identity(), 1e-6)) {
+                    Eigen::Matrix3d ee_rot_curr = data_.oMf[ee_rot_id_].rotation();
+                    Eigen::Vector3d e_rot = log3_rotation(target_rot * ee_rot_curr.transpose());
+
+                    Eigen::MatrixXd J_rot_full(6, model_.nv);
+                    J_rot_full.setZero();
+                    pinocchio::getFrameJacobian(model_, data_, ee_rot_id_,
+                                                pinocchio::LOCAL_WORLD_ALIGNED, J_rot_full);
+                    // Только угловая часть (3 rot)
+                    Eigen::MatrixXd J_rot = J_rot_full.bottomRows(3);
+
+                    // Проецируем в null-space позиции
+                    Eigen::MatrixXd J_rot_proj = J_rot * N_pos;
+                    Eigen::Matrix3d JJt_rot = J_rot_proj * J_rot_proj.transpose();
+                    JJt_rot.diagonal().array() += lambda * lambda;
+                    Eigen::Vector3d x_rot = JJt_rot.ldlt().solve(e_rot);
+                    Eigen::VectorXd dq_rot = N_pos * J_rot_proj.transpose() * x_rot;
+
+                    v_task += dq_rot;
+                }
+                // v_task теперь: dq_pos + dq_rot, position решается точно,
+                // rotation — в null-space (rank 3 для secondary criteria)
 
                 Eigen::VectorXd z = Eigen::VectorXd::Zero(model_.nv);
                 z += w_jc   * (q_mid - q);
                 z += w_prev * (q_start - q);
                 if (w_drift > 0.0)
                     z += w_drift * (q_start - q);
-                // Null-space фиксация gripper (q[5]) — тянем к q_start[5]
+                // Null-space фиксация gripper (q[5] = moving_jaw) — тянем к q_start[5]
                 if (gripper_mode == "hold")
                     z(5) += w_gripper * (q_start[5] - q[5]);
                 if (w_pref > 0.0)
                     z += w_pref * (q_pref - q);
                 if (w_man > 0.0)
-                    z += w_man * numericalManipGradient(J.topRows(3), q, man_th);
+                    z += w_man * numericalManipGradient(J_pos, q, man_th);
 
                 // Self-collision CBF barrier — only when distance < d_min + margin
                 if (w_collision > 0.0) {
@@ -326,7 +336,7 @@ private:
                     }
                 }
 
-                Eigen::VectorXd dq = v_task + N * z;
+                Eigen::VectorXd dq = v_task + N_pos * z;
 
                 if (err_norm > prev_err) {
                     dt *= 0.8;
@@ -656,7 +666,9 @@ private:
     // Pinocchio
     pinocchio::Model model_;
     pinocchio::Data data_;
-    pinocchio::FrameIndex ee_id_;
+    pinocchio::FrameIndex ee_id_;          // backward-compat (== ee_rot_id_)
+    pinocchio::FrameIndex ee_pos_id_;      // для position task (gripper_link, на оси wrist_roll)
+    pinocchio::FrameIndex ee_rot_id_;      // для orientation task (gripper_frame_link, на конце)
 
     // Self-collision: non-adjacent pairs (link_name, link_name)
     const std::vector<std::pair<std::string,std::string>> collision_pairs_ = {

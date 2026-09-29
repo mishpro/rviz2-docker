@@ -4,7 +4,7 @@
 Publishes 6D PoseStamped targets to /target_pose. Reads keyboard in a
 separate thread with non-blocking select() so ROS 2 spin is never blocked.
 
-Keys:
+Keys (translations in world frame; rotations around world axes):
   Translation (step via +/-):
     T/G : +/- X      A/D : +/- Y      W/S : +/- Z
   Rotation (step via [/]):
@@ -16,6 +16,10 @@ Keys:
     R : reset to home pose (identity quat)
     H : help (reprint controls)
     Q : quit
+
+Note: rotations are pre-multiplied (R * q), so pressing U rolls the EE around
+the WORLD X axis. With task-priority IK this does NOT move gripper_link — only
+gripper_frame_link rotates at the end of the arm.
 
 Usage (inside container, after ros2 launch):
     python3 scripts/teleop_keyboard.py
@@ -35,7 +39,7 @@ HELP_TEXT = """
 SO-101 Teleop (6D PoseStamped):
   Translation (step via +/-):
     T/G : +/- X      A/D : +/- Y      W/S : +/- Z
-  Rotation (step via [/]):
+  Rotation (step via [/]) — around WORLD axes:
     J/L : yaw   +/-    I/K : pitch +/-    U/O : roll  +/-
   Step:
     +/- : translation step (1mm <-> 10mm)
@@ -93,7 +97,7 @@ class TeleopNode(Node):
                 self.handle_key(ch)
 
     def apply_rotation(self, axis, angle):
-        """Multiply current quat by small rotation around world axis."""
+        """Apply small rotation around world axis: R * q (world frame)."""
         half = angle / 2.0
         s = math.sin(half)
         dx, dy, dz, dw = 0.0, 0.0, 0.0, math.cos(half)
@@ -104,14 +108,15 @@ class TeleopNode(Node):
         elif axis == 'z':
             dz = s
         qx, qy, qz, qw = self.target_quat
-        # q * R = (qw*d.xyz + dw*q.xyz + q.xyz × d.xyz, qw*dw - q.xyz · d.xyz)
-        cx = qy * dz - qz * dy
-        cy = qz * dx - qx * dz
-        cz = qx * dy - qy * dx
-        nx = qw * dx + dw * qx + cx
-        ny = qw * dy + dw * qy + cy
-        nz = qw * dz + dw * qz + cz
-        nw = qw * dw - (qx * dx + qy * dy + qz * dz)
+        # R * q = (dw*q.xyz + qw*d.xyz + d.xyz × q.xyz, dw*qw - d.xyz · q.xyz)
+        # d.xyz × q.xyz = (dy*qz - dz*qy, dz*qx - dx*qz, dx*qy - dy*qx)
+        cx = dy * qz - dz * qy
+        cy = dz * qx - dx * qz
+        cz = dx * qy - dy * qx
+        nx = dw * qx + qw * dx + cx
+        ny = dw * qy + qw * dy + cy
+        nz = dw * qz + qw * dz + cz
+        nw = dw * qw - (dx * qx + dy * qy + dz * qz)
         norm = math.sqrt(nx * nx + ny * ny + nz * nz + nw * nw)
         self.target_quat = [nx / norm, ny / norm, nz / norm, nw / norm]
 

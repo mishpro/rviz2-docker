@@ -9,25 +9,30 @@ URDF: `/workspace/SO-ARM100/Simulation/SO101/so101_new_calib.urdf` (монтир
 
 ## 1. Алгоритм
 
-Базовый алгоритм — **Damped Least Squares (DLS)** в операционном пространстве (CLIK), расширенный до **6D (SE(3))**:
+Базовый алгоритм — **Damped Least Squares (DLS)** в операционном пространстве (CLIK) с **task priority** на двух разных фреймах:
 
-1. Прямая кинематика `EE(q)` → `ee_pos`, `ee_rot`.
-2. **6D error**:
-   - Позиционная: `e_pos = target_pos − ee_pos`.
-   - Ориентационная: `e_rot = log3(R_target · R_currentᵀ)` (axis-angle, через Rodrigues inverse).
-   - `e_6d = [e_pos; e_rot]`.
-3. **Backward-compat**: если `R_target ≈ I` (identity quaternion), `e_rot := 0` → только position control.
-4. **6×n_v Jacobian** через `getFrameJacobian(LOCAL_WORLD_ALIGNED)`.
-5. **Weighted DLS**: `v_task = J^T · W · (W·J·J^T·W + λ²I)⁻¹ · W·e_6d`,
-   где `W = diag([w_pos·I3, w_orient·I3])` (default `w_pos = w_orient = 1.0`).
-6. **Null-space проектор** (через unweighted pseudo-inverse): `N = I − J⁺ · J`.
-7. **Null-step** — сумма аттракторов:
-   ```
-   z = w_jc·(q_mid−q) + w_prev·(q_start−q) [+ w_drift·(q_start−q)] +
-       w_pref·(q_pref−q) + w_man·∇μ [+ w_coll·CBF barrier]
-   ```
-8. **Шаг**: `q ← integrate(q, dt · (v_task + N · z))`, затем **velocity clamp** + **CBF joint bounds** + position clip.
-9. Итерации до сходимости (`‖W·e_6d‖ < ik_eps`) или исчерпания `ik_max_iter`.
+1. **Два EE-фрейма**:
+   - `gripper_link` — **для position task** (на оси `wrist_roll`, не сдвигается при вращении кисти).
+   - `gripper_frame_link` — **для orientation task** (на конце кисти, ~10 см впереди, смещён от оси вращения). Используется также для публикации `/ee_pose`.
+2. **Прямая кинематика** → `ee_pos_pos = oMf[gripper_link].translation`, `ee_rot_curr = oMf[gripper_frame_link].rotation`.
+3. **Position error**: `e_pos = target_pos − ee_pos_pos` (3×1).
+4. **Backward-compat**: если `R_target ≈ I` (identity quaternion), orientation task пропускается → только position control.
+5. **Orientation error**: `e_rot = log3(R_target · R_rot_currᵀ)` (3×1, axis-angle).
+6. **Position Jacobian** (3×6) — линейная часть для `gripper_link` через `getFrameJacobian(LOCAL_WORLD_ALIGNED)`.
+7. **Position DLS**: `dq_pos = J_pos^T · (J_pos · J_pos^T + λ²I)⁻¹ · e_pos` (точно решает позицию).
+8. **Null-space проектор**: `N_pos = I − J_pos⁺ · J_pos` (ранг 3).
+9. **Orientation DLS** в null-space (только если `R_target ≠ I`):
+   - `J_rot_proj = J_rot · N_pos` (3×6, rotation в null-space).
+   - `dq_rot = N_pos · J_rot_proj^T · (J_rot_proj · J_rot_proj^T + λ²I)⁻¹ · e_rot`.
+   - `v_task = dq_pos + dq_rot` (position решается точно, orientation — в null-space).
+10. **Null-step** — сумма аттракторов (вторичные цели):
+    ```
+    z = w_jc·(q_mid−q) + w_prev·(q_start−q) [+ w_drift·(q_start−q)] +
+        w_pref·(q_pref−q) + w_man·∇μ [+ w_gripper·(q_start[5]−q[5])] [+ w_coll·CBF barrier]
+    ```
+    `z(5)` — null-space критерий для фиксации gripper (q[5] = `moving_jaw`).
+11. **Шаг**: `q ← integrate(q, dt · (v_task + N_pos · z))`, затем velocity clamp + CBF joint bounds + position clip.
+12. Итерации до сходимости (`‖e_pos‖ < ik_eps`) или исчерпания `ik_max_iter`.
 
 ---
 
@@ -53,7 +58,8 @@ URDF: `/workspace/SO-ARM100/Simulation/SO101/so101_new_calib.urdf` (монтир
 | 16 | 6D error + weighted DLS (см. §1) | `solveIK()` | `weight_pos` = 1.0, `weight_orient` = 1.0 |
 | 17 | Мягкая классификация результата | `solveIK()` | `ik_eps` = 1e-4, `ik_eps_visual` = 0.01 |
 | 18 | **Quintic min-jerk smoother** (interpolation в `timerCallback`) | `timerCallback()` | `interp_steps` = 100 |
-| 19 | **5×6 DLS + null-space fix для gripper** | `solveIK()` | `gripper_mode` = "hold", `weight_gripper` = 5.0 |
+| 19 | **Task priority IK**: position (gripper_link) → orientation (gripper_frame_link) в null-space | `solveIK()` | `ee_pos_id`="gripper_link", `ee_rot_id`="gripper_frame_link" |
+| 20 | **Null-space фиксация gripper (q[5] = moving_jaw)** | `solveIK()` | `gripper_mode` = "hold", `weight_gripper` = 5.0 |
 
 ---
 
@@ -119,6 +125,12 @@ ros2 topic pub --once /target_pose geometry_msgs/msg/PoseStamped \
 
 `orientation` — кватернион `(x, y, z, w)`. Identity `w=1, x=y=z=0` → только position control (backward-compat).
 Для 6D control — задавайте не-identity quaternion.
+
+**Где IK достигает каждой цели (task priority):**
+- `position` (3 trans) применяется к **`gripper_link`** — фрейм на оси `wrist_roll`, не сдвигается при вращении кисти.
+- `orientation` (3 rot) применяется к **`gripper_frame_link`** — фрейм на конце кисти, описывает окружность при вращении `wrist_roll`. При вращении кисти `gripper_link` остаётся на месте, `gripper_frame_link` поворачивается.
+
+Импульсы `position` и `orientation` разделены: position решается **точно** (приоритет 1), orientation — в null-space позиции (приоритет 2). Конфликта между ними нет.
 
 ### Тесты (27 случаев)
 
@@ -228,7 +240,8 @@ ros2 param set /so101_ik_node weight_gripper 10.0     # сильнее тяну�
 5. **Numerical gradient** для self-collision — finite differences с h=1e-3. Шумный у сингулярностей.
 6. **`preferred_q` подобран под SO-101**. Для другой морфологии манипулятора нужно пересмотреть.
 7. **Joint-origin как link center** для sphere collision check. Sphere radius покрывает бо́льшую область → более консервативная оценка.
-8. **5-DOF IK** (3 trans + 2 rot): yaw-компонента ориентации не управляется. Выбор 5×6 обусловлен тем, что 6-DOF/6-task без redundancy → gripper (q[5]) получал dq от DLS и дёргался непредсказуемо. Через null-space `z(5) = w_gripper · (q_start[5] − q[5])` gripper фиксируется (`gripper_mode=hold`). При `gripper_mode=free` поведение — как до фикса (но yaw всё равно не управляется). Управление раскрытием/закрытием схвата требует отдельного топика/команды (TODO).
+8. **Task priority IK**: position (gripper_link) — главная задача, orientation (gripper_frame_link) — вторичная в null-space. Это **гарантирует**, что при вращении кисти позиция `gripper_link` остаётся на месте (т.к. она на оси `wrist_roll`). Если ориентация требует позы вне досягаемости — она «жертвуется», позиция сохраняется. `gripper_mode=hold` (по умолчанию) фиксирует q[5] (`moving_jaw`) через null-space criterion; `gripper_mode=free` отключает фиксацию (использовать только при добавлении отдельного управления gripper).
+9. **`gripper_frame_link` смещён от оси `wrist_roll`** на 9.8 см по Z и 7.9 мм по X. Использование `gripper_link` (на оси) для position task исключает эффект «вращение кисти смещает кончик».
 
 ---
 
