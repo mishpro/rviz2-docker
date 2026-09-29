@@ -207,10 +207,12 @@ ros2 param set /so101_ik_node weight_gripper 10.0     # сильнее тяну�
 |----------|---------|------------|
 | `publish_rate` | 50.0 | Hz, timer для joint_states |
 | `interp_steps` | 100 | шагов интерполяции (quintic) |
-| `ik_max_iter` | 500 | макс итераций IK |
+| `ik_max_iter` | 500 | макс итераций IK (position task) |
+| `ik_max_iter_rot` | 1500 | макс итераций IK с orientation task (медленнее сходится) |
 | `perturb_scales` | [0.05, 0.15, 0.30, 0.50, 0.80] | амплитуды multistart |
 | `auto_flip_restart` | true | flip shoulder_pan для целей за base |
-| `ik_eps` | 1e-4 | сходимость по weighted norm |
+| `ik_eps` | 1e-4 | сходимость по position (м) |
+| `ik_eps_rot` | 1e-3 | сходимость по orientation (rad ≈ 0.06°) |
 | `ik_eps_visual` | 0.01 | порог 🟢 |
 | `ik_dt`, `ik_dt_min`, `ik_dt_max` | 0.1, 0.05, 0.5 | адаптивный шаг |
 | `ik_damp` | 1e-6 | DLS damping базовый |

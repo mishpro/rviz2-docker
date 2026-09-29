@@ -61,9 +61,11 @@ public:
         declare_parameter("publish_rate", 50.0);
         declare_parameter("interp_steps", 100);
         declare_parameter("ik_max_iter", 500);
+        declare_parameter("ik_max_iter_rot", 1500);  // для orientation task (медленнее сходится)
         declare_parameter("perturb_scales", std::vector<double>{0.05, 0.15, 0.30, 0.50, 0.80});
         declare_parameter("auto_flip_restart", true);
         declare_parameter("ik_eps", 1e-4);
+        declare_parameter("ik_eps_rot", 1e-3);  // orientation task: 1e-3 rad ≈ 0.06°
         declare_parameter("ik_eps_visual", 0.01);
         declare_parameter("ik_dt", 1e-1);
         declare_parameter("ik_dt_min", 5e-2);
@@ -195,8 +197,10 @@ private:
                             IKStatus* status)
     {
         int max_iter = get_parameter("ik_max_iter").as_int();
+        int max_iter_rot = get_parameter("ik_max_iter_rot").as_int();
         auto perturb_scales = get_parameter("perturb_scales").as_double_array();
         double eps    = get_parameter("ik_eps").as_double();
+        double eps_rot = get_parameter("ik_eps_rot").as_double();
         double eps_v  = get_parameter("ik_eps_visual").as_double();
         double dt0    = get_parameter("ik_dt").as_double();
         double dt_min = get_parameter("ik_dt_min").as_double();
@@ -239,7 +243,11 @@ private:
             double prev_err = std::numeric_limits<double>::infinity();
             int stuck_count = 0;
 
-            for (int i = 0; i < max_iter; ++i) {
+            // Определяем effective iter count: больше итераций если есть rotation task
+            bool has_rot_task = !target_rot.isApprox(Eigen::Matrix3d::Identity(), 1e-6);
+            int max_iter_eff = has_rot_task ? std::max(max_iter, max_iter_rot) : max_iter;
+
+            for (int i = 0; i < max_iter_eff; ++i) {
                 pinocchio::forwardKinematics(model_, data_, q);
                 pinocchio::updateFramePlacements(model_, data_);
 
@@ -253,12 +261,14 @@ private:
                 Eigen::Matrix3d ee_rot_curr = data_.oMf[ee_rot_id_].rotation();
                 Eigen::Vector3d e_rot = log3_rotation(target_rot * ee_rot_curr.transpose());
 
-                // === Convergence check по ОБЕИМ задачам ===
+                // === Convergence check по ОБЕИМ задачам (отдельные eps) ===
                 double pos_err_norm = e_pos.norm();
                 double rot_err_norm = e_rot.norm();
                 double combined_err = pos_err_norm + 0.5 * rot_err_norm;
 
-                if (pos_err_norm < eps && rot_err_norm < eps) {
+                bool pos_ok = (pos_err_norm < eps);
+                bool rot_ok = (rot_err_norm < eps_rot);
+                if (pos_ok && rot_ok) {
                     converged = true; best_q = q; best_err = combined_err; break;
                 }
                 if (combined_err < best_err) { best_q = q; best_err = combined_err; }
@@ -283,8 +293,13 @@ private:
                 Eigen::Vector3d x_pos = JJt_pos.ldlt().solve(e_pos);
                 Eigen::VectorXd dq_pos = J_pos.transpose() * x_pos;  // size 6
 
-                // Null-space проектор для позиции (rank 3)
-                Eigen::MatrixXd J_pos_pinv = J_pos.transpose() * JJt_pos.ldlt().solve(
+                // Null-space проектор: lambda_proj (МАЛОЕ, не lambda!)
+                // Большое lambda в проекторе → протекание ориентации в позицию.
+                // lambda_proj = min(lambda, 1e-4) сохраняет ортогональность.
+                double lambda_proj = std::min(lambda, 1e-4);
+                Eigen::Matrix3d JJt_proj = J_pos * J_pos.transpose();
+                JJt_proj.diagonal().array() += lambda_proj * lambda_proj;
+                Eigen::MatrixXd J_pos_pinv = J_pos.transpose() * JJt_proj.ldlt().solve(
                     Eigen::Matrix3d::Identity());
                 Eigen::MatrixXd N_pos = Eigen::MatrixXd::Identity(model_.nv, model_.nv)
                                        - J_pos_pinv * J_pos;
@@ -310,6 +325,18 @@ private:
                 }
                 // v_task теперь: dq_pos + dq_rot, position решается точно,
                 // rotation — в null-space (rank 3 для secondary criteria)
+
+                // === Отладочный вывод (каждые 50 итераций) ===
+                if (i == 0 || i % 50 == 0) {
+                    Eigen::Vector3d gripper_link_pos_now = data_.oMf[ee_pos_id_].translation();
+                    RCLCPP_INFO(get_logger(),
+                        "IK iter %d: pos_err=%.5f rot_err=%.5f |dq_pos|=%.4f |dq|=%.4f ee=[%.3f,%.3f,%.3f] target=[%.3f,%.3f,%.3f] lambda=%.4f lambda_proj=%.6f",
+                        i, pos_err_norm, rot_err_norm,
+                        dq_pos.norm(), v_task.norm(),
+                        gripper_link_pos_now.x(), gripper_link_pos_now.y(), gripper_link_pos_now.z(),
+                        target.x(), target.y(), target.z(),
+                        lambda, lambda_proj);
+                }
 
                 Eigen::VectorXd z = Eigen::VectorXd::Zero(model_.nv);
                 z += w_jc   * (q_mid - q);
