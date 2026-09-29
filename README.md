@@ -50,9 +50,10 @@ URDF: `/workspace/SO-ARM100/Simulation/SO101/so101_new_calib.urdf` (монтир
 | 13 | **Velocity limit** per joint (clamp `dq`) | `solveIK()` | `vel_max` = [1.0×6] rad/s |
 | 14 | **CBF joint bounds** (dynamic bound у лимитов) | `solveIK()` | `mu_boundary` = 5.0 |
 | 15 | **Self-collision CBF barrier** (link-to-link) | `solveIK()` | `weight_collision` = 0.5, `collision_d_min` = 0.005 м, `collision_margin` = 0.010 м |
-| 16 | 6D error + weighted DLS (см. §1) | `solveIK()` | `weight_pos` = 1.0, `weight_orient` = 1.0 |
-| 17 | Мягкая классификация результата | `solveIK()` | `ik_eps` = 1e-4, `ik_eps_visual` = 0.01 |
-| 18 | **Quintic min-jerk smoother** (interpolation в `timerCallback`) | `timerCallback()` | `interp_steps` = 100 |
+| 16 | 6D error + weighted DLS (см. §1) | `solveIK()` | `weight_pos` = 10.0, `weight_orient` = 1.0 |
+| 17 | **lambda_proj separation**: малый damping для null-space псевдоинверсии → точный null-space | `solveIK()` | `lambda_proj` = `min(lambda, 1e-4)` (auto) |
+| 18 | Мягкая классификация результата | `solveIK()` | `ik_eps` = 1e-4, `ik_eps_visual` = 0.01 |
+| 19 | **Quintic min-jerk smoother** (интерполяция в `timerCallback`) | `timerCallback()` | `interp_steps` = 100 |
 
 ---
 
@@ -182,7 +183,7 @@ R: reset to home       H: help      Q: quit
 ```bash
 ros2 param list /so101_ik_node
 ros2 param set /so101_ik_node weight_pref 0.3
-ros2 param set /so101_ik_node weight_orient 0.5       # 6D orientation weight
+ros2 param set /so101_ik_node weight_orient 2.0       # увеличить вес ориентации (по умолчанию 1.0)
 ros2 param set /so101_ik_node vel_max "[2.0, 2.0, ...]" # увеличить velocity limit
 ```
 
@@ -202,7 +203,7 @@ ros2 param set /so101_ik_node vel_max "[2.0, 2.0, ...]" # увеличить vel
 | `ik_man_k`, `ik_man_thresh` | 1e-4, 1e-4 | адаптивное демпфирование по μ |
 | `weight_jc`, `weight_man`, `weight_prev`, `weight_pref`, `weight_drift` | 0.5, 0.2, 0.3, 0.5, 0.1 | null-space компоненты |
 | `preferred_q` | [0.0, -0.3, 1.0, -0.7, 0.0, 0.0] | предпочтительная поза |
-| `weight_pos`, `weight_orient` | 1.0, 0.5 | 6D task weights |
+| `weight_pos`, `weight_orient` | 10.0, 1.0 | 6D task weights (позиция приоритетнее ориентации для teleop) |
 | `vel_max` | [1.0×6] rad/s | velocity limit per joint |
 | `mu_boundary` | 5.0 | CBF joint bound coefficient |
 | `weight_collision` | 0.5 | self-collision barrier weight |

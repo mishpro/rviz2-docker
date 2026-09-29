@@ -85,7 +85,7 @@ public:
         declare_parameter("weight_collision", 0.5);
         declare_parameter("collision_d_min", 0.005);
         declare_parameter("collision_margin", 0.010);
-        declare_parameter("weight_pos", 1.0);
+        declare_parameter("weight_pos", 10.0);    // позиция приоритетнее ориентации (для teleop)
         declare_parameter("weight_orient", 1.0);
 
         // Рабочая область: r_max через FK в нескольких позах
@@ -277,9 +277,21 @@ private:
                 Eigen::Matrix<double,6,1> x = JJt.ldlt().solve(W * err);
                 Eigen::VectorXd v_task = Jw.transpose() * x;
 
-                // Null-space projector uses unweighted Jacobian pseudo-inverse
+                // Отладочный вывод каждые 50 итераций
+                if (i == 0 || i % 50 == 0) {
+                    RCLCPP_INFO(get_logger(),
+                        "IK iter %d: pos_err=%.5f rot_err=%.5f |W*e|=%.4f |v_task|=%.4f ee=[%.3f,%.3f,%.3f] target=[%.3f,%.3f,%.3f] lambda=%.4f",
+                        i, e_pos.norm(), e_rot.norm(), (W * err).norm(), v_task.norm(),
+                        ee_pos.x(), ee_pos.y(), ee_pos.z(),
+                        target.x(), target.y(), target.z(), lambda);
+                }
+
+                // Null-space projector uses unweighted Jacobian pseudo-inverse.
+                // lambda_proj (small) делает проектор точнее — большой lambda
+                // приводит к "протеканию" вторичных критериев в основную задачу.
+                double lambda_proj = std::min(lambda, 1e-4);
                 Eigen::Matrix<double,6,6> JJt_uw = J * J.transpose();
-                JJt_uw.diagonal().array() += lambda * lambda;
+                JJt_uw.diagonal().array() += lambda_proj * lambda_proj;
                 Eigen::MatrixXd Jplus = J.transpose() * JJt_uw.ldlt().solve(
                     Eigen::Matrix<double,6,6>::Identity());
                 Eigen::MatrixXd N = Eigen::MatrixXd::Identity(model_.nv, model_.nv) - Jplus * J;
