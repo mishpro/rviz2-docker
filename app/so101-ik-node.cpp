@@ -227,6 +227,10 @@ private:
         bool converged = false;
 
         auto runIKLoop = [&](Eigen::VectorXd q) {
+            RCLCPP_INFO(get_logger(),
+                "runIKLoop start: q=[%.3f,%.3f,%.3f,%.3f,%.3f,%.3f] target_pos=[%.3f,%.3f,%.3f]",
+                q[0], q[1], q[2], q[3], q[4], q[5],
+                target.x(), target.y(), target.z());
             double dt = dt0;
             double prev_err = std::numeric_limits<double>::infinity();
             int stuck_count = 0;
@@ -251,7 +255,13 @@ private:
                 wnorm_diag << w_pos_orient, w_pos_orient, w_pos_orient,
                               w_orient_orient, w_orient_orient, w_orient_orient;
                 double err_norm = (wnorm_diag.asDiagonal() * err).norm();
-                if (err_norm < eps) { converged = true; best_q = q; best_err = err_norm; break; }
+                if (err_norm < eps) {
+                    converged = true; best_q = q; best_err = err_norm;
+                    RCLCPP_INFO(get_logger(),
+                        "runIKLoop converged: iters=%d, final_pos_err=%.5f, final_rot_err=%.5f, mu=%.6f",
+                        i, pos_err_norm, rot_err_norm, mu);
+                    break;
+                }
                 if (err_norm < best_err) { best_q = q; best_err = err_norm; }
 
                 Eigen::MatrixXd J(6, model_.nv);
@@ -336,8 +346,9 @@ private:
                     stuck_count = 0;
                 }
                 if (stuck_count > stuck_patience) {
-                    RCLCPP_DEBUG(get_logger(),
-                        "IK stuck at iter %d (err=%.4f)", i, err_norm);
+                    RCLCPP_INFO(get_logger(),
+                        "runIKLoop stuck at iter %d: pos_err=%.5f rot_err=%.5f mu=%.6f",
+                        i, pos_err_norm, rot_err_norm, mu);
                     break;
                 }
                 dt = std::clamp(dt, dt_min, dt_max);
@@ -351,16 +362,35 @@ private:
             }
         };
 
+        // IK start: log q_start norms для диагностики
+        RCLCPP_INFO(get_logger(),
+            "IK start: target_pos=[%.3f,%.3f,%.3f], q_start_norm=%.3f, q_target_norm=%.3f, q_start_interp_norm=%.3f",
+            target.x(), target.y(), target.z(),
+            q_start.norm(), q_target_.norm(), q_start_interp_.norm());
+
         // 0-й запуск: чистый q_start; далее — рестарты с разными масштабами возмущения
         for (size_t restart = 0; restart <= perturb_scales.size() && !converged; ++restart) {
             Eigen::VectorXd q;
             if (restart == 0) q = q_start;
             else              q = perturbConfig(q_start, rng, perturb_scales[restart - 1]);
+            RCLCPP_INFO(get_logger(),
+                "IK restart %zu/%zu, perturb_scale=%.3f, q_norm=%.3f, q=[%.3f,%.3f,%.3f,%.3f,%.3f,%.3f]",
+                restart, perturb_scales.size(),
+                restart == 0 ? 0.0 : perturb_scales[restart - 1],
+                q.norm(),
+                q[0], q[1], q[2], q[3], q[4], q[5]);
             runIKLoop(q);
         }
 
         // Финальная попытка: явный «flip» shoulder_pan для целей за спиной base
         if (auto_flip && !converged) {
+            pinocchio::forwardKinematics(model_, data_, q_start);
+            pinocchio::updateFramePlacement(model_, data_, ee_pos_id_);
+            Eigen::Vector3d ee_dir = (data_.oMf[ee_pos_id_].translation() - base_pos_).normalized();
+            Eigen::Vector3d tgt_dir = (target - base_pos_).normalized();
+            RCLCPP_INFO(get_logger(),
+                "IK flipShoulderPan: ee_dir·tgt_dir=%.3f, auto_flip=%d, converged=%d",
+                ee_dir.dot(tgt_dir), auto_flip, converged);
             Eigen::VectorXd q = flipShoulderPan(q_start, rng, target);
             runIKLoop(q);
         }
