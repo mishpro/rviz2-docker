@@ -258,8 +258,8 @@ private:
                 if (err_norm < eps) {
                     converged = true; best_q = q; best_err = err_norm;
                     RCLCPP_INFO(get_logger(),
-                        "runIKLoop converged: iters=%d, final_pos_err=%.5f, final_rot_err=%.5f, mu=%.6f",
-                        i, pos_err_norm, rot_err_norm, mu);
+                        "runIKLoop converged: iter=%d, pos_err=%.5f, rot_err=%.5f",
+                        i, e_pos.norm(), e_rot.norm());
                     break;
                 }
                 if (err_norm < best_err) { best_q = q; best_err = err_norm; }
@@ -347,8 +347,8 @@ private:
                 }
                 if (stuck_count > stuck_patience) {
                     RCLCPP_INFO(get_logger(),
-                        "runIKLoop stuck at iter %d: pos_err=%.5f rot_err=%.5f mu=%.6f",
-                        i, pos_err_norm, rot_err_norm, mu);
+                        "runIKLoop stuck at iter %d: pos_err=%.5f rot_err=%.5f",
+                        i, e_pos.norm(), e_rot.norm());
                     break;
                 }
                 dt = std::clamp(dt, dt_min, dt_max);
@@ -385,8 +385,8 @@ private:
         // Финальная попытка: явный «flip» shoulder_pan для целей за спиной base
         if (auto_flip && !converged) {
             pinocchio::forwardKinematics(model_, data_, q_start);
-            pinocchio::updateFramePlacement(model_, data_, ee_pos_id_);
-            Eigen::Vector3d ee_dir = (data_.oMf[ee_pos_id_].translation() - base_pos_).normalized();
+            pinocchio::updateFramePlacement(model_, data_, ee_id_);
+            Eigen::Vector3d ee_dir = (data_.oMf[ee_id_].translation() - base_pos_).normalized();
             Eigen::Vector3d tgt_dir = (target - base_pos_).normalized();
             RCLCPP_INFO(get_logger(),
                 "IK flipShoulderPan: ee_dir·tgt_dir=%.3f, auto_flip=%d, converged=%d",
