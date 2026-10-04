@@ -5,6 +5,12 @@
 
 URDF: `/workspace/SO-ARM100/Simulation/SO101/so101_new_calib.urdf` (монтируется в контейнер на этапе сборки образа).
 
+**См. также**:
+- [`docs/topics.md`](docs/topics.md) — форматы ROS 2 топиков
+- [`docs/diagrams.md`](docs/diagrams.md) — Mermaid-диаграммы (потоки данных, state machine, архитектура)
+- [`docs/sequence.md`](docs/sequence.md) — sequence diagram потока /target_pose → /joint_states
+- [`docs/robot_state_publisher.md`](docs/robot_state_publisher.md) — описание компонента robot_state_publisher
+
 ---
 
 ## 1. Алгоритм
@@ -195,16 +201,16 @@ ros2 param set /so101_ik_node vel_max "[2.0, 2.0, ...]" # увеличить о�
 | `ik_max_iter` | 500 | макс. итераций IK |
 | `perturb_scales` | [0.05, 0.15, 0.30, 0.50, 0.80] | амплитуды мультистарта |
 | `auto_flip_restart` | true | отражение shoulder_pan для целей за базой |
-| `ik_eps` | 1e-4 | сходимость по взвешенной норме |
-| `ik_eps_visual` | 0.01 | порог 🟢 |
+| `ik_eps` | 1e-4 | сходимость по взвешенной норме (внутренний критерий для IK) |
+| `ik_eps_visual` | 0.01 | порог 🟢 для отображения статуса `Converged` (только визуальный, не влияет на IK) |
 | `ik_dt`, `ik_dt_min`, `ik_dt_max` | 0.1, 0.05, 0.5 | адаптивный шаг |
 | `ik_damp` | 1e-6 | DLS демпфирование базовое |
 | `ik_man_k`, `ik_man_thresh` | 1e-4, 1e-4 | адаптивное демпфирование по μ |
 | `weight_jc`, `weight_man`, `weight_prev`, `weight_pref`, `weight_drift` | 0.5, 0.2, 0.3, 0.5, 0.1 | компоненты нуль-пространства |
 | `preferred_q` | [0.0, -0.3, 1.0, -0.7, 0.0, 0.0] | предпочтительная поза |
 | `weight_pos`, `weight_orient` | 1.0, 0.5 | веса 6D задачи |
-| `vel_max` | [1.0×6] рад/с | ограничение скорости на сустав |
-| `mu_boundary` | 5.0 | коэффициент границы через CBF |
+| `vel_max` | [1.0×6] рад/с | ограничение скорости на сустав (clamp dq после IK шага) |
+| `mu_boundary` | 5.0 | коэффициент границы через CBF (adaptive joint bound: `q_bound = upper - mu_boundary * (1 - μ/μ_thresh)` — чем ближе к сингулярности, тем жёстче граница) |
 | `weight_collision` | 0.5 | вес барьера самоколлизий |
 | `collision_d_min` | 0.005 м | минимальное расстояние между линками |
 | `collision_margin` | 0.010 м | зона активации барьера |
@@ -241,10 +247,17 @@ rviz2-docker/
 │   │   └── so101_ik.launch.py  # robot_state_publisher + ik + rviz
 │   └── config/
 │       └── so101.rviz          # конфиг RViz (Interact активен по умолчанию)
-└── scripts/
-    ├── run_all_tests.sh        # 27 тестов A/B/C/D (6D PoseStamped)
-    ├── run_drift_tests.py      # тест дрейфа в замкнутом цикле (с --publish-dt)
-    └── teleop_keyboard.py      # автономный узел на Python для ручного управления
+├── scripts/
+│   ├── run_all_tests.sh        # 27 тестов A/B/C/D (6D PoseStamped)
+│   ├── run_drift_tests.py      # тест дрейфа в замкнутом цикле (с --publish-dt)
+│   └── teleop_keyboard.py      # автономный узел на Python для ручного управления
+└── docs/
+    ├── topics.md                       # форматы ROS 2 топиков + примеры JSON
+    ├── diagrams.md                     # Mermaid-диаграммы (data flow, state machine, архитектура)
+    ├── sequence.md                     # sequence diagram /target_pose → /joint_states
+    ├── sequence.puml                   # PlantUML-версия той же диаграммы
+    ├── sequence.svg                    # отрендеренный SVG
+    └── robot_state_publisher.md        # описание robot_state_publisher
 ```
 
 URDF и ассеты подгружаются в `/workspace/SO-ARM100/...` на этапе сборки образа (см. `Dockerfile`, шаг `git clone https://github.com/TheRobotStudio/SO-ARM100.git`).
