@@ -1,0 +1,46 @@
+@startuml sequence_diagram
+' ROS 2 sequence diagram: /target_pose → /joint_states поток
+' Показывает полный путь от пользовательского ввода до публикации углов суставов
+
+actor User
+participant "teleop_keyboard.py\nили run_drift_tests.py" as Input
+participant "/target_pose\nPoseStamped" as TargetPose
+participant "so101_ik_node" as IKNode
+participant "/joint_states\nJointState" as JointStates
+participant "robot_state_publisher" as RSPub
+participant "/tf\nTFMessage" as TF
+participant "RViz2" as RViz
+
+User -> Input : нажимает клавишу (T/G/...) или генерирует PoseStamped
+Input -> TargetPose : публикует target PoseStamped
+TargetPose -> IKNode : callback (50 Гц polling)
+
+activate IKNode
+IKNode -> IKNode : forwardKinematics(q) → ee_pos, ee_rot
+IKNode -> IKNode : computeJacobian(q) → J
+IKNode -> IKNode : runIKLoop:
+  1. err = [target_pos - ee_pos; log(R_target · ee_rotᵀ)]
+  2. если ‖err‖ < eps → converged
+  3. иначе: v_task = J^T·W·(W·JJ^T·W + λ²I)⁻¹·W·e
+  4. N = I - J^+·J
+  5. z = sum_null_space_attractors (jc, prev, pref, man, drift, coll)
+  6. q += dt·(v_task + N·z)
+  7. clamp velocity, apply CBF bounds, clip position
+  8. если stuck → multistart perturb (5 попыток)
+IKNode -> IKNode : computeCollisionMarkers
+deactivate IKNode
+
+IKNode -> JointStates : publish JointState (50 Гц)
+IKNode -> TargetPose : publish target_marker (vis_msgs/Marker)
+IKNode -> TargetPose : publish ee_pose (PoseStamped)
+IKNode -> TargetPose : publish collision_marker (vis_msgs/Marker)
+
+JointStates -> RSPub : подписка
+RSPub -> RSPub : read URDF, compute FK по chain
+RSPub -> TF : publish tf2_msgs/TFMessage (100 Гц)
+
+TF -> RViz : TF buffer update
+JointStates -> RViz : прямой subscriber для JointState (через TF)
+TargetPose -> RViz : markers (через TF)
+
+@enduml
