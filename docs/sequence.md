@@ -62,11 +62,11 @@ README в репо → диаграмма рендерится автомати�
 
 ### PlantUML
 ```bash
-plantuml -tsvg app/docs/sequence.puml
+plantuml -tsvg docs/sequence.puml
 ```
 
 ## Источник
 
-- [`app/docs/sequence.puml`](./sequence.puml) — PlantUML-оригинал
-- [`app/robot_state_publisher.md`](./robot_state_publisher.md) — описание компонента robot_state_publisher
+- [`docs/sequence.puml`](./sequence.puml) — PlantUML-оригинал
+- [`docs/robot_state_publisher.md`](./robot_state_publisher.md) — описание компонента robot_state_publisher
 - [`docs/topics.md`](../../docs/topics.md) — форматы всех ROS 2 топиков

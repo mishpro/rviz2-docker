@@ -127,15 +127,15 @@ flowchart TB
 
 ### Просмотр в Markdown-рендерере (GitHub, GitLab, VS Code)
 
-Просто откройте `app/diagrams.md` — Mermaid-блоки отрендерятся автоматически.
+Просто откройте `docs/diagrams.md` — Mermaid-блоки отрендерятся автоматически.
 
 ### Рендеринг в SVG/PNG
 
 ```bash
 # Требует @mermaid-js/mermaid-cli (npm install -g @mermaid-js/mermaid-cli)
-npx -p @mermaid-js/mermaid-cli mmdc -i app/diagrams.md -o app/diagrams.svg
+npx -p @mermaid-js/mermaid-cli mmdc -i docs/diagrams.md -o docs/diagrams.svg
 
 # Или через Python (без mmdc)
 python <SKILL_ROOT>/diagram-generator/scripts/render_diagram.py \
-  app/diagrams.md --format svg --out app/diagrams.svg
+  docs/diagrams.md --format svg --out docs/diagrams.svg
 ```
